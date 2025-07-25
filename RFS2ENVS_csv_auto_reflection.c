@@ -170,31 +170,37 @@ void calculate_stats(double* signal, int size, double* mean, double* std_dev) {
 }
 
 
-// 최종 개선된 자동 반사 신호 탐지 알고리즘
-// (첫 기준점 정밀 탐지 + 반사폭 고려 + 최종 상대 진폭 필터링)
+// 최종 하이브리드 동적 분석 알고리즘
 void detect_automatic_reflection_points(double* signal, int size, double sample_interval_s, int* out_indices, int* out_count, int max_points) {
     *out_count = 0;
-    if (size < 50) return; // 최소 데이터 크기 확인
+    if (size < 50) return;
 
-    // 1. 노이즈 레벨 추정
+    // --- 1. 초기 설정 및 노이즈 추정 ---
+    int temp_indices[max_points];
+    int temp_count = 0;
+
     int noise_sample_size = size / 10 > 100 ? 100 : (size / 10 < 20 ? 20 : size / 10);
     if (noise_sample_size >= size) noise_sample_size = size - 1;
 
     double noise_mean, noise_std_dev;
     calculate_stats(signal, noise_sample_size, &noise_mean, &noise_std_dev);
 
-    // 2. 적응형 임계값 및 파라미터 설정
-    const double K_SENSITIVITY = 5.0;    // 신호 탐지 민감도 계수
-    const double SUSTAIN_FACTOR = 0.5;   // -6dB, 피크 높이의 50%를 에너지 유지 임계값으로 설정
-    const int MIN_PEAK_INTERVAL = 30;    // 다음 탐색까지의 최소 이격 샘플 수
+    // --- 2. 파라미터 정의 ---
+    const double K_SENSITIVITY = 5.0;
+    const double SUSTAIN_FACTOR = 0.5;      // -6dB, 초기 구간 블라인드 존 설정용
+    const int MIN_PEAK_INTERVAL = 30;
+    const double LATE_ZONE_THRESHOLD_RATIO = 0.3; // 최대 진폭의 30% 이하부터 후기 구간으로 간주
+    const double REJECTION_RATIO = 0.15;    // 최종 필터링 비율 (최대 진폭의 15%)
 
     double adaptive_threshold = noise_mean + K_SENSITIVITY * noise_std_dev;
-    if (adaptive_threshold < 0.05) adaptive_threshold = 0.05; // 최소 임계값 보장
+    if (adaptive_threshold < 0.05) adaptive_threshold = 0.05;
 
+    // --- 3. 하이브리드 탐색 루프 ---
     int current_search_idx = 1;
+    double max_amplitude_so_far = 0.0;
+    int analysis_mode = 0; // 0: 초기 구간(고해상도), 1: 후기 구간(고안정성)
 
-    while (current_search_idx < size - 1 && *out_count < max_points) {
-        // 3. 임계값을 최초로 넘는 지점 탐색
+    while (current_search_idx < size - 1 && temp_count < max_points) {
         int cross_idx = -1;
         for (int i = current_search_idx; i < size; i++) {
             if (signal[i] > adaptive_threshold) {
@@ -202,12 +208,8 @@ void detect_automatic_reflection_points(double* signal, int size, double sample_
                 break;
             }
         }
+        if (cross_idx == -1) break;
 
-        if (cross_idx == -1) { // 더 이상 임계값을 넘는 신호가 없으면 종료
-            break;
-        }
-
-        // 4. 리딩 엣지(최대 기울기) 및 피크 지점 탐색
         int search_window = 50;
         int search_end = cross_idx + search_window;
         if (search_end >= size) search_end = size - 1;
@@ -217,78 +219,61 @@ void detect_automatic_reflection_points(double* signal, int size, double sample_
         for (int i = cross_idx; i <= search_end; i++) {
             if (i > 0) {
                 double grad = signal[i] - signal[i - 1];
-                if (grad > max_grad) {
-                    max_grad = grad;
-                    leading_edge_idx = i;
-                }
+                if (grad > max_grad) { max_grad = grad; leading_edge_idx = i; }
             }
         }
 
         int peak_idx = leading_edge_idx;
         for (int i = leading_edge_idx; i <= search_end; i++) {
-            if (signal[i] > signal[peak_idx]) {
-                peak_idx = i;
-            }
+            if (signal[i] > signal[peak_idx]) { peak_idx = i; }
         }
-        
-        // 중복 탐지 방지: 바로 이전 포인트와 너무 가까우면 무시
-        if (*out_count > 0 && (leading_edge_idx - out_indices[*out_count - 1]) < MIN_PEAK_INTERVAL) {
-            current_search_idx = peak_idx + 1; // 현재 피크는 건너뛰고 계속 탐색
+
+        if (temp_count > 0 && (leading_edge_idx - temp_indices[temp_count - 1]) < MIN_PEAK_INTERVAL) {
+            current_search_idx = peak_idx + 1;
             continue;
         }
 
-        out_indices[*out_count] = leading_edge_idx;
-        (*out_count)++;
-
-        // 5. 블라인드 구간 설정: 현재 피크의 에너지가 50% 이하로 떨어질 때까지 탐색 중지
-        double sustain_threshold = signal[peak_idx] * SUSTAIN_FACTOR;
-        int echo_end_idx = peak_idx;
-        for (int i = peak_idx + 1; i < size; i++) {
-            if (signal[i] < sustain_threshold) {
-                echo_end_idx = i;
-                break;
-            }
-            if (i == size - 1) { // 신호 끝까지 에너지가 유지될 경우
-                echo_end_idx = i;
-            }
+        double current_amplitude = signal[peak_idx];
+        if (current_amplitude > max_amplitude_so_far) {
+            max_amplitude_so_far = current_amplitude;
         }
 
-        // 6. 다음 탐색 시작 위치를 블라인드 구간 이후로 업데이트
-        current_search_idx = echo_end_idx + MIN_PEAK_INTERVAL;
+        // 모드 전환 체크: 현재 피크가 최대 피크의 30%보다 작으면 후기 구간 모드로 전환
+        if (analysis_mode == 0 && current_amplitude < max_amplitude_so_far * LATE_ZONE_THRESHOLD_RATIO) {
+            analysis_mode = 1; // 후기 구간(고안정성) 모드로 전환
+        }
+
+        temp_indices[temp_count++] = leading_edge_idx;
+
+        // 다음 탐색 위치 결정 (하이브리드 로직)
+        if (analysis_mode == 0) { // 초기 구간: -6dB 감쇠 지점까지 블라인드
+            double sustain_threshold = current_amplitude * SUSTAIN_FACTOR;
+            int echo_end_idx = peak_idx;
+            for (int i = peak_idx + 1; i < size; i++) {
+                if (signal[i] < sustain_threshold) { echo_end_idx = i; break; }
+                if (i == size - 1) { echo_end_idx = i; }
+            }
+            current_search_idx = echo_end_idx + 1;
+        } else { // 후기 구간: 고정된 최소 간격만큼만 블라인드
+            current_search_idx = peak_idx + MIN_PEAK_INTERVAL;
+        }
     }
 
-    // --- 최종 필터링: 최대 신호 대비 작은 신호(노이즈) 제거 ---
-    if (*out_count > 1) { // 반사점이 2개 이상일 때만 필터링 의미가 있음
-        // 1. 최대 진폭 찾기 (리딩 엣지에서의 신호값 기준)
-        double max_amplitude = 0.0;
-        for (int i = 0; i < *out_count; i++) {
-            if (signal[out_indices[i]] > max_amplitude) {
-                max_amplitude = signal[out_indices[i]];
+    // --- 4. 최종 상대 진폭 필터링 ---
+    if (temp_count > 1) {
+        double rejection_threshold = max_amplitude_so_far * REJECTION_RATIO;
+        
+        // 첫 번째 기준점은 항상 유지
+        out_indices[(*out_count)++] = temp_indices[0];
+
+        for (int i = 1; i < temp_count; i++) {
+            // 리딩 엣지에서의 신호 크기를 기준으로 필터링
+            if (signal[temp_indices[i]] >= rejection_threshold) {
+                out_indices[(*out_count)++] = temp_indices[i];
             }
         }
-
-        // 2. 동적 제거 임계값 설정 (최대 진폭의 15%)
-        const double REJECTION_RATIO = 0.15;
-        double rejection_threshold = max_amplitude * REJECTION_RATIO;
-
-        // 3. 필터링된 결과를 저장할 임시 배열
-        int filtered_indices[max_points];
-        int filtered_count = 0;
-
-        // 첫 번째 기준점(가장 중요)은 크기와 상관없이 항상 포함
-        filtered_indices[filtered_count++] = out_indices[0];
-
-        // 4. 두 번째 반사점부터 크기를 비교하여 필터링
-        for (int i = 1; i < *out_count; i++) {
-            if (signal[out_indices[i]] >= rejection_threshold) {
-                filtered_indices[filtered_count++] = out_indices[i];
-            }
-        }
-
-        // 5. 최종 결과로 업데이트
-        *out_count = filtered_count;
-        for (int i = 0; i < filtered_count; i++) {
-            out_indices[i] = filtered_indices[i];
-        }
+    } else if (temp_count == 1) { // 반사점이 하나만 있으면 그대로 사용
+        out_indices[0] = temp_indices[0];
+        *out_count = 1;
     }
 }
